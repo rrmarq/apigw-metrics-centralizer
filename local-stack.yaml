@@ -1,0 +1,594 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Modelo de CloudFormation para criar um REST API Gateway com destino de log de acesso no Kinesis Firehose e back-end Lambda
+Parameters:
+  ProjectName:
+    Type: String
+
+  StageName:
+    Type: String
+    Default: prod
+  
+  LambdaCleanPayloadName:
+    Type: String
+    Default: PayloadCleaning
+
+  CentralAccount:
+    Type: String
+
+Resources:
+  RestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Ref ProjectName
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+
+  ApiUsagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    DependsOn: APIGWStage
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      UsagePlanName: !Sub ${ProjectName}-Usage-Plan
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: 'prod'
+      Quota:
+        Limit: 10000
+        Period: MONTH
+        Offset: 0
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+  ApiKey1:
+    Type: 'AWS::ApiGateway::ApiKey'
+    DependsOn: APIGWStage
+    Properties:
+      Enabled: true
+      Name: !Sub ${ProjectName}-1
+      Value: "1234567890-1234567890"
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: !Ref StageName
+  ApiKey2:
+    Type: 'AWS::ApiGateway::ApiKey'
+    DependsOn: APIGWStage
+    Properties:
+      Enabled: true
+      Name: !Sub ${ProjectName}-2
+      Value: "9876543210-9876543210"
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: !Ref StageName
+  ApiKey3:
+    Type: 'AWS::ApiGateway::ApiKey'
+    DependsOn: APIGWStage
+    Properties:
+      Enabled: true
+      Name: !Sub ${ProjectName}-3
+      Value: "5678943210-5678943210"
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: !Ref StageName
+  
+  UsagePlanKey1:
+    Type: 'AWS::ApiGateway::UsagePlanKey'
+    DependsOn: ApiUsagePlan
+    Properties:
+      KeyId: !Ref ApiKey1
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+  
+  UsagePlanKey2:
+    Type: 'AWS::ApiGateway::UsagePlanKey'
+    DependsOn: ApiUsagePlan
+    Properties:
+      KeyId: !Ref ApiKey2
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  UsagePlanKey3:
+    Type: 'AWS::ApiGateway::UsagePlanKey'
+    DependsOn: ApiUsagePlan
+    Properties:
+      KeyId: !Ref ApiKey3
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  HWResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: hello-world
+
+  HWMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      ApiKeyRequired: true
+      AuthorizationType: 'NONE'
+      HttpMethod: 'GET'
+      ResourceId: !Ref HWResource
+      RestApiId: !Ref RestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations'
+
+  HWErrorResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: hello-world-error
+
+  HWErrorMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      ApiKeyRequired: true
+      AuthorizationType: 'NONE'
+      HttpMethod: 'GET'
+      ResourceId: !Ref HWErrorResource
+      RestApiId: !Ref RestApi
+      Integration:
+        Type: 'MOCK'
+        RequestTemplates:
+          application/json: "{\"statusCode\": 500}"
+        IntegrationResponses:
+          - StatusCode: 500
+            ResponseTemplates:
+              application/json: "{\"message\": \"Houston, we have a problem!\"}"
+
+  KinesisFirehoseDeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamType: DirectPut
+      DeliveryStreamName: 'amazon-apigateway-access-logs'
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      ExtendedS3DestinationConfiguration:
+        BucketArn: !GetAtt [BucketLogs, Arn]
+        RoleArn: !GetAtt [DeliveryStreamRole, Arn]
+        CompressionFormat: 'UNCOMPRESSED'
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 128
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub 'Destination-${ProjectName}'
+          LogStreamName: !Sub '${ProjectName}/stream'
+        Prefix: '!{timestamp:yyyy-MM-dd}/!{partitionKeyFromQuery:requestId}'
+        ErrorOutputPrefix: 'errors'
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+          - Type: MetadataExtraction
+            Parameters:
+            - ParameterName: MetadataExtractionQuery
+              ParameterValue: '{requestId : .requestId}'
+            - ParameterName: JsonParsingEngine
+              ParameterValue: JQ-1.6
+          - Type: RecordDeAggregation
+            Parameters:
+            - ParameterName: SubRecordType
+              ParameterValue: JSON
+
+
+
+
+  DeliveryStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'DeliveryStreamPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !GetAtt [BucketLogs, Arn]
+                  - !Sub
+                    - ${bucket}/*
+                    - { bucket: !GetAtt [BucketLogs, Arn]}
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref ProjectName
+      Handler: 'index.handler'
+      Role: !GetAtt [LambdaExecutionRole, Arn]
+      Runtime: 'nodejs12.x'
+      Code:
+        S3Bucket: !Sub capstone-artifacts-${CentralAccount}
+        S3Key: 'lambda-HW/index.zip'
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+
+  LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaFunction
+      Principal: 'apigateway.amazonaws.com'
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service: "lambda.amazonaws.com"
+          Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: "MyLambdaPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+
+  DeploymentV2:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: HWMethod
+    Properties:
+      RestApiId: !Ref RestApi
+
+
+  APIGWStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: DeploymentV2
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      StageName: !Ref StageName
+      Description: Prod Stage
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref DeploymentV2
+      AccessLogSetting:
+        DestinationArn: !GetAtt [KinesisFirehoseDeliveryStream, Arn]
+        Format: "{	\"apiId\": \"$context.apiId\",	
+                    \"requestId\": \"$context.requestId\",	
+                    \"ip\": \"$context.identity.sourceIp\",	
+                    \"apiKey\": \"$context.identity.apiKey\",	
+                    \"account\": \"$context.accountId\",	
+                    \"requestTime\": \"$context.requestTime\",	
+                    \"httpMethod\": \"$context.httpMethod\",	
+                    \"resourcePath\": \"$context.resourcePath\",	
+                    \"status\": \"$context.status\",	
+                    \"protocol\": \"$context.protocol\",	
+                    \"responseLength\": \"$context.responseLength\",	
+                    \"errorMessage\": \"$context.error.message\",	
+                    \"authorization\": {		\"status\": \"$context.authorize.status\",		
+                                            \"error\": \"$context.authorize.error\",		
+                                            \"latency\": \"$context.authorize.latency\"	
+                                        },	
+                    \"authentication\": {		\"status\": \"$context.authenticate.status\",		
+                                            \"error\": \"$context.authenticate.error\",		
+                                            \"latency\": \"$context.authenticate.latency\"	
+                                        },	
+                    \"integrations\": {		\"status\": \"$context.integration.status\",		
+                                          \"error\": \"$context.integration.error\",		
+                                          \"latency\": \"$context.integration.latency\"	
+                                      }
+                  }"
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: StateMachineRole
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      DefinitionString: !Sub |
+        {
+            "Comment": "A description of my state machine",
+            "StartAt": "DMap",
+            "States": {
+              "DMap": {
+                "Type": "Map",
+                "ItemProcessor": {
+                  "ProcessorConfig": {
+                    "Mode": "DISTRIBUTED",
+                    "ExecutionType": "EXPRESS"
+                  },
+                  "StartAt": "Test-Input",
+                  "States": {
+                    "Test-Input": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                        "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaCleanPayloadName}:$LATEST",
+                        "Payload.$": "$"
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 2,
+                          "MaxAttempts": 6,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "ResultPath": "$",
+                      "End": true
+                    }
+                  }
+                },
+                "Label": "DMap",
+                "MaxConcurrency": 1000,
+                "ItemReader": {
+                  "Resource": "arn:aws:states:::s3:listObjectsV2",
+                  "Parameters": {
+                    "Bucket.$": "$.bucket",
+                    "Prefix.$": "$.prefix"
+                  }
+                },
+                "ToleratedFailurePercentage": 5,
+                "ItemBatcher": {
+                  "MaxItemsPerBatch": 10,
+                  "BatchInput": {
+                    "bucket.$": "States.Format('${ProjectName}-{}',$.account)"
+                  }
+                },
+                "ResultPath": "$.Payload",
+                "Next": "SendTaskSuccess",
+                "ResultWriter": {
+                  "Resource": "arn:aws:states:::s3:putObject",
+                  "Parameters": {
+                    "Bucket": "${ProjectName}-${AWS::AccountId}",
+                    "Prefix": "map-processed"
+                  }
+                },
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "SendTaskFailure",
+                    "ResultPath": "$.Error"
+                  }
+                ]
+              },
+              "SendTaskFailure": {
+                "Type": "Task",
+                "End": true,
+                "Parameters": {
+                  "TaskToken.$": "$.MyTaskToken"
+                },
+                "Resource": "arn:aws:states:::aws-sdk:sfn:sendTaskFailure",
+                "Credentials": {
+                  "RoleArn": "arn:aws:iam::${CentralAccount}:role/Centralizer-send-signal-state"
+                }
+              },
+              "SendTaskSuccess": {
+                "Type": "Task",
+                "End": true,
+                "Parameters": {
+                  "Output.$": "$.Payload.ResultWriterDetails",
+                  "TaskToken.$": "$.MyTaskToken"
+                },
+                "Resource": "arn:aws:states:::aws-sdk:sfn:sendTaskSuccess",
+                "Credentials": {
+                  "RoleArn": "arn:aws:iam::${CentralAccount}:role/Centralizer-send-signal-state"
+                }
+              }
+            }
+          }
+      RoleArn: !GetAtt StateMachineRole.Arn
+      StateMachineType: STANDARD
+      StateMachineName: !Sub "${ProjectName}-local-logs"
+
+
+  StateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      RoleName: !Sub ${ProjectName}-local-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: 
+              - "states.amazonaws.com"
+              AWS: 
+              - !Sub "arn:aws:iam::${CentralAccount}:role/${ProjectName}-centralizer"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "StateMachinePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "states:StartExecution"
+                  - "states:DescribeExecution"
+                  - "states:StopExecution"
+                Resource: !Sub "arn:aws:states:us-east-1:${AWS::AccountId}:stateMachine:${ProjectName}-local-logs"
+              - Effect: "Allow"
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:ListMultipartUploadParts"
+                Resource: 
+                  - !GetAtt [BucketLogs, Arn]
+                  - !Join ["", [!GetAtt [BucketLogs, Arn], "/*"]]
+              - Effect: "Allow"
+                Action:
+                  - "sts:AssumeRole"
+                Resource: 
+                  - !Sub "arn:aws:iam::${CentralAccount}:role/Centralizer-send-signal-state"
+              - Effect: "Allow"
+                Action:
+                  - "events:PutTargets"
+                  - "events:PutRule"
+                  - "events:DescribeRule"
+                Resource: 
+                  - !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule'
+              - Effect: "Allow"
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                  - "xray:GetSamplingRules"
+                  - "xray:GetSamplingTargets"
+                Resource: "*"
+
+  LambdaFunctionCleaning:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: LambdaCleaningExecutionRole
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      FunctionName: !Ref LambdaCleanPayloadName
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt [LambdaCleaningExecutionRole, Arn]
+      Runtime: 'python3.9'
+      MemorySize: 512
+      Timeout: 180
+      Architectures: 
+        - arm64
+      Code:
+        S3Bucket: !Sub capstone-artifacts-${CentralAccount}
+        S3Key: 'lambda-cleaning/index.zip'
+
+  LambdaCleaningPermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn: LambdaFunctionCleaning
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaCleanPayloadName
+      Principal: 'states.amazonaws.com'
+
+  LambdaCleaningExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service: 
+            - "lambda.amazonaws.com"
+          Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: "MyLambdaPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: "Allow"
+            Action:
+              - "s3:ListBucket"
+              - "s3:PutObject"
+              - "s3:GetObject"
+              - "s3:AbortMultipartUpload"
+              - "s3:ListMultipartUploadParts"
+            Resource: 
+              - !GetAtt [BucketLogs, Arn]
+              - !Join ["", [!GetAtt [BucketLogs, Arn], "/*"]]
+
+
+  BucketLogs:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join ["", [!Ref ProjectName, "-", !Ref "AWS::AccountId"]]
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketLogs
+      PolicyDocument:
+        Statement:
+          - Sid: CrossAccount
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !Sub arn:aws:iam::${CentralAccount}:role/${ProjectName}-centralizer
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:GetObjectAcl
+              - s3:ListBucket
+            Resource: 
+              - !GetAtt [BucketLogs, Arn]
+              - !Join ["", [!GetAtt [BucketLogs, Arn], "/*"]]
+
+Outputs:
+  RestApiUrl:
+    Description: URL do REST API Gateway
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod'

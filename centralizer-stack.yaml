@@ -1,0 +1,918 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Modelo de CloudFormation para criar um REST API Gateway com destino de log de acesso no Kinesis Firehose e back-end Lambda
+Parameters:
+  ProjectName:
+    Type: String
+
+  StageName:
+    Type: String
+    Default: prod
+  
+  LambdaCleanPayloadName:
+    Type: String
+    Default: PayloadCleaning
+
+  BucketArtifacts:
+    Type: String
+
+  Regions:
+    Type: CommaDelimitedList
+
+  OUs:
+    Type: CommaDelimitedList
+
+  Orgs:
+    Type: CommaDelimitedList
+
+  EmailNotification:
+    Type: String
+
+Resources:
+  StateMachine:
+    DependsOn: AthenaNamedQuery
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: StateMachineRole
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "A description of my state machine",
+            "StartAt": "Obtem contas",
+            "States": {
+              "Obtem contas": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-list-accounts:$LATEST"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Map"
+              },
+              "Map": {
+                "Type": "Map",
+                "ItemProcessor": {
+                  "ProcessorConfig": {
+                    "Mode": "DISTRIBUTED",
+                    "ExecutionType": "STANDARD"
+                  },
+                  "StartAt": "${ProjectName}-local-logs",
+                  "States": {
+                    "${ProjectName}-local-logs": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::states:startExecution.waitForTaskToken",
+                      "Parameters": {
+                        "StateMachineArn.$": "States.Format('arn:aws:states:us-east-1:{}:stateMachine:${ProjectName}-local-logs', $.account)",
+                        "Input": {
+                          "account.$": "$.account",
+                          "bucket.$": "States.Format('${ProjectName}-{}', $.account)",
+                          "prefix.$": "$.data_exec",
+                          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id",
+                          "MyTaskToken.$": "$$.Task.Token"
+                        }
+                      },
+                      "Credentials": {
+                        "RoleArn.$": "$.role-to-assume"
+                      },
+                      "Next": "Open Manifest",
+                      "ResultPath": "$.output"
+                    },
+                    "Open Manifest": {
+                      "Type": "Task",
+                      "Parameters": {
+                        "Bucket.$": "$.output.Bucket",
+                        "Key.$": "$.output.Key"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+                      "Credentials": {
+                        "RoleArn.$": "$.role-to-assume"
+                      },
+                      "ResultPath": "$.output",
+                      "Next": "CopyObject",
+                      "ResultSelector": {
+                        "body.$": "States.StringToJson($.Body)"
+                      }
+                    },
+                    "CopyObject": {
+                      "Type": "Task",
+                      "Parameters": {
+                        "Bucket": "${ProjectName}-centralizer-${AWS::AccountId}",
+                        "CopySource.$": "States.Format('{}/{}', $.output.body.DestinationBucket, $.output.body.ResultFiles.SUCCEEDED[0].Key)",
+                        "Key.$": "States.Format('{}/{}.json', $.data_exec, $.account)"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+                      "ResultPath": "$.output",
+                      "Next": "Prepare input key"
+                    },
+                    "Prepare input key": {
+                      "Type": "Pass",
+                      "Next": "DMap Reduce",
+                      "Parameters": {
+                        "account.$": "$.account",
+                        "data_exec.$": "$.data_exec",
+                        "role-to-assume.$": "$.role-to-assume",
+                        "bucket_central": "${ProjectName}-centralizer-${AWS::AccountId}",
+                        "key.$": "States.Format('{}/{}.json', $.data_exec, $.account)"
+                      },
+                      "ResultPath": "$.output"
+                    },
+                    "DMap Reduce": {
+                      "Type": "Map",
+                      "ItemProcessor": {
+                        "ProcessorConfig": {
+                          "Mode": "DISTRIBUTED",
+                          "ExecutionType": "EXPRESS"
+                        },
+                        "StartAt": "Prepare",
+                        "States": {
+                          "Prepare": {
+                            "Type": "Pass",
+                            "Parameters": {
+                              "body.$": "States.StringToJson($.Output)",
+                              "name.$": "$.Name",
+                              "prefix.$": "States.StringSplit($.StartDate,'T')"
+                            },
+                            "Next": "Split Logs",
+                            "ResultPath": "$.output"
+                          },
+                          "Split Logs": {
+                            "Type": "Map",
+                            "ItemProcessor": {
+                              "ProcessorConfig": {
+                                "Mode": "INLINE"
+                              },
+                              "StartAt": "PutObject",
+                              "States": {
+                                "PutObject": {
+                                  "Type": "Task",
+                                  "End": true,
+                                  "Parameters": {
+                                    "Body.$": "$",
+                                    "Bucket": "${ProjectName}-centralizer-${AWS::AccountId}",
+                                    "Key.$": "States.Format('athena/{}.json', $.reqId)"
+                                  },
+                                  "Resource": "arn:aws:states:::aws-sdk:s3:putObject"
+                                }
+                              }
+                            },
+                            "End": true,
+                            "ItemsPath": "$.output.body.Items",
+                            "ResultPath": null
+                          }
+                        }
+                      },
+                      "End": true,
+                      "Label": "DMapReduce",
+                      "MaxConcurrency": 1000,
+                      "ItemReader": {
+                        "Resource": "arn:aws:states:::s3:getObject",
+                        "ReaderConfig": {
+                          "InputType": "JSON"
+                        },
+                        "Parameters": {
+                          "Bucket.$": "$.bucket_central",
+                          "Key.$": "$.output.key"
+                        }
+                      },
+                      "ResultPath": null,
+                      "OutputPath": "$.data_exec",
+                      "ResultWriter": {
+                        "Resource": "arn:aws:states:::s3:putObject",
+                        "Parameters": {
+                          "Bucket": "${ProjectName}-centralizer-${AWS::AccountId}",
+                          "Prefix": "dmap-processed"
+                        }
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "States.ALL"
+                          ],
+                          "BackoffRate": 1,
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 1
+                        }
+                      ]
+                    }
+                  }
+                },
+                "ItemsPath": "$",
+                "MaxConcurrency": 1000,
+                "Next": "GetNamedQuery",
+                "ResultPath": null,
+                "Label": "Map",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "BackoffRate": 1,
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 1
+                  }
+                ],
+                "ToleratedFailurePercentage": 5,
+                "ItemSelector": {
+                  "account.$": "$$.Map.Item.Value.account",
+                  "data_exec.$": "States.ArrayGetItem(States.StringSplit($$.Map.Item.Value.data_exec, 'T'),0)",
+                  "role-to-assume.$": "$$.Map.Item.Value.role-to-assume",
+                  "bucket_central.$": "$$.Map.Item.Value.bucket_central"
+                }
+              },
+              "GetNamedQuery": {
+                "Type": "Task",
+                "Next": "Athena StartQueryExecution",
+                "Parameters": {
+                  "NamedQueryId": "${QueryId}"
+                },
+                "Resource": "arn:aws:states:::aws-sdk:athena:getNamedQuery"
+              },
+              "Athena StartQueryExecution": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                "Parameters": {
+                  "QueryString.$": "$.NamedQuery.QueryString",
+                  "WorkGroup.$": "$.NamedQuery.WorkGroup",
+                  "ResultConfiguration": {
+                    "OutputLocation": "s3://${ProjectName}-centralizer-${AWS::AccountId}/athena-result/"
+                  }
+                },
+                "Next": "Athena GetQueryResults",
+                "ResultSelector": {
+                  "QueryExecutionId.$": "$.QueryExecution.QueryExecutionId"
+                },
+                "ResultPath": "$"
+              },
+              "Athena GetQueryResults": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::athena:getQueryResults",
+                "Parameters": {
+                  "QueryExecutionId.$": "$.QueryExecutionId"
+                },
+                "Next": "Lambda Invoke"
+              },
+              "Lambda Invoke": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionMessage}:$LATEST",
+                  "Payload": {
+                    "Records.$": "$.ResultSet.Rows",
+                    "URLQuickSight": "https://us-east-1.quicksight.aws.amazon.com/sn/dashboards/6c691eb5-4f8a-45fa-b3dd-e3b07f92ed1d"
+                  }
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "SNS Publish"
+              },
+              "SNS Publish": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "Subject": "Processamento logs API Gateway",
+                  "Message.$": "States.StringToJson($.body)",
+                  "TopicArn": "arn:aws:sns:us-east-1:${AWS::AccountId}:${ProjectName}-Topic-Messages"
+                },
+                "Next": "CreateIngestion"
+              },
+              "CreateIngestion": {
+                "Type": "Task",
+                "Parameters": {
+                  "AwsAccountId": "${AWS::AccountId}",
+                  "DataSetId": "3c1ba7e0-6fc4-4af2-94f6-490fecb65594",
+                  "IngestionId.$": "States.UUID()"
+                },
+                "Resource": "arn:aws:states:::aws-sdk:quicksight:createIngestion",
+                "End": true
+              }
+            }
+          }
+        - QueryId: !GetAtt AthenaNamedQuery.NamedQueryId
+      RoleArn: !GetAtt StateMachineRole.Arn
+      StateMachineType: STANDARD
+      StateMachineName: !Sub "${ProjectName}-centralizer-logs"
+
+
+  StateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      RoleName: !Sub ${ProjectName}-centralizer
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: 
+              - "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "StateMachinePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:GetBucketLocation"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "states:StartExecution"
+                  - "states:DescribeExecution"
+                  - "states:StopExecution"
+                Resource: 
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-centralizer-logs'
+              - Effect: "Allow"
+                Action:
+                  - "states:SendTaskSuccess"
+                  - "states:SendTaskFailure"
+                Resource: 
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-centralizer-logs"
+              - Effect: "Allow"
+                Action:
+                  - "events:PutTargets"
+                  - "events:PutRule"
+                  - "events:DescribeRule"
+                Resource: 
+                  - !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule'
+              - Effect: "Allow"
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                  - "xray:GetSamplingRules"
+                  - "xray:GetSamplingTargets"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: !Sub "arn:aws:sns:*:${AWS::AccountId}:*"
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogDelivery"
+                  - "logs:GetLogDelivery"
+                  - "logs:UpdateLogDelivery"
+                  - "logs:DeleteLogDelivery"
+                  - "logs:ListLogDeliveries"
+                  - "logs:PutResourcePolicy"
+                  - "logs:DescribeResourcePolicies"
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "sts:AssumeRole"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "athena:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "glue:GetTable"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "quicksight:CreateIngestion"
+                Resource: !Sub "arn:aws:quicksight:*:${AWS::AccountId}:dataset/*/ingestion/*"
+
+  LambdaFunctionMessage:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: LambdaFunctionMessageExecutionRole
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      FunctionName: !Sub '${ProjectName}-centralizer-message'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt [LambdaFunctionMessageExecutionRole, Arn]
+      Runtime: 'python3.9'
+      MemorySize: 512
+      Timeout: 60
+      Architectures: 
+        - arm64
+      Code:
+        S3Bucket: !Sub 'capstone-artifacts-${AWS::AccountId}'
+        S3Key: 'lambda-message/index.zip'
+
+  LambdaFunctionMessagePermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn: LambdaFunctionMessage
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaFunctionMessage
+      Principal: 'states.amazonaws.com'
+
+  LambdaFunctionMessageExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service: 
+            - "lambda.amazonaws.com"
+          Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: "MyLambdaPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+
+  LambdaFunctionAccounts:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: LambdaFunctionAccountsExecutionRole
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      FunctionName: !Sub '${ProjectName}-list-accounts'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt [LambdaFunctionAccountsExecutionRole, Arn]
+      Runtime: 'python3.9'
+      MemorySize: 256
+      Timeout: 60
+      Architectures: 
+        - arm64
+      Code:
+        S3Bucket: !Sub 'capstone-artifacts-${AWS::AccountId}'
+        S3Key: 'lambda-list-accounts/index.zip'
+
+  LambdaFunctionAccountPermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn: LambdaFunctionAccounts
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaFunctionAccounts
+      Principal: 'states.amazonaws.com'
+
+  LambdaFunctionAccountsExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service: 
+            - "lambda.amazonaws.com"
+          Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: "MyLambdaPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: "Allow"
+            Action:
+              - "organizations:ListAccounts"
+            Resource: "*"
+
+  BucketLogsCentralizer:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join ["", [!Ref ProjectName, "-centralizer-", !Ref "AWS::AccountId"]]
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+
+  LogsTable:
+    Type: AWS::Glue::Table
+    DependsOn: BucketLogsCentralizer
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: default
+      TableInput:
+        Name: !Sub ${ProjectName}-central-logs
+        Description: 'Tabela com logs de todas as contas e regioes'
+        Parameters:
+          classification: json
+          EXTERNAL: TRUE
+        StorageDescriptor:
+          Location: !Sub s3://${ProjectName}-centralizer-${AWS::AccountId}/athena
+          InputFormat: 'org.apache.hadoop.mapred.TextInputFormat'
+          OutputFormat: 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+          SerdeInfo:
+            SerializationLibrary: 'org.openx.data.jsonserde.JsonSerDe'
+            Parameters:
+              mapping: TRUE
+              serialization.format: 1
+              ignore.malformed.json: FALSE
+              dots.in.keys: FALSE
+              case.insensitive: TRUE
+          Columns:
+            - Name: apikey
+              Type: string
+            - Name: ip
+              Type: string
+            - Name: status
+              Type: int
+            - Name: latency
+              Type: int
+            - Name: time
+              Type: date
+            - Name: account
+              Type: string
+            - Name: path
+              Type: string
+            - Name: size
+              Type: int
+            - Name: method
+              Type: string
+            - Name: reqid
+              Type: string
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      Description: Workgroup for logs centralizer solution
+      Name: Logs-Centralizer
+      State: ENABLED
+      WorkGroupConfiguration: 
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${ProjectName}-centralizer-${AWS::AccountId}/athena-result/
+          EncryptionConfiguration: 
+            EncryptionOption: SSE_S3
+
+  AthenaNamedQuery:
+    DependsOn: AthenaWorkgroup
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: default
+      Name: !Sub ${ProjectName}-Query-Logs
+      QueryString: !Sub >
+        WITH temp AS (
+            SELECT 
+            apiKey,
+            count(distinct(status)) as errors
+            FROM "default"."${ProjectName}-central-logs"
+            WHERE cast(status as int) between 500 and 599
+            GROUP BY (apiKey)
+        )
+        SELECT 
+        distinct(a.apiKey) as "apikey",
+        a.account,
+        count(a.status) + count(errors) as "total",
+        count(a.status) as "success",
+        count(b.errors) as "errors",
+        sum(size) as "total-size",
+        sum(latency)/(count(a.status) + count(errors)) as "latency"
+        FROM "default"."${ProjectName}-central-logs" as a
+        left join temp as b
+        on a.apiKey = b.apiKey
+        where a.status between 200 and 499 and time = current_date
+
+        group by a.apiKey, a.account
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Endpoint: !Ref EmailNotification
+        Protocol: email
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      TopicName: !Sub ${ProjectName}-Topic-Messages
+      TracingConfig: Active
+
+  QuickSightDataSet:
+    DependsOn: QuickSightDataSource
+    Type: AWS::QuickSight::DataSet
+    Properties: 
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AwsAccountId: !Ref AWS::AccountId
+      ImportMode: SPICE
+      Name: !Sub ${ProjectName}-DataSet
+      DataSetId: 3c1ba7e0-6fc4-4af2-94f6-490fecb65594
+      PhysicalTableMap: 
+        Athena:
+          RelationalTable:
+            Catalog: AwsDataCatalog
+            Name: !Sub ${ProjectName}-central-logs
+            DataSourceArn: !GetAtt QuickSightDataSource.Arn
+            Schema: default
+            InputColumns: 
+            - Name: apikey
+              Type: STRING
+            - Name: ip
+              Type: STRING
+            - Name: status
+              Type: INTEGER
+            - Name: latency
+              Type: INTEGER
+            - Name: time
+              Type: DATETIME
+            - Name: account
+              Type: STRING
+            - Name: path
+              Type: STRING
+            - Name: size
+              Type: INTEGER
+            - Name: method
+              Type: STRING
+            - Name: reqid
+              Type: STRING
+      LogicalTableMap:
+          Athena:
+            Alias: !Sub ${ProjectName}-central-logs
+            Source:
+              PhysicalTableId: Athena
+      Permissions:
+        - Principal: "arn:aws:quicksight:us-east-1:566574573255:user/default/admin/rrmarq-Isengard"
+          Actions:
+            - quicksight:UpdateDataSetPermissions
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+
+  QuickSightDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: 1994d673-2102-4f6c-99a8-0172dbe0fa90
+      DataSourceParameters: 
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkgroup
+      Name: !Sub ${ProjectName}-DataSource
+      SslProperties: 
+        DisableSsl: false
+      Type: ATHENA
+      Permissions:
+        - Principal:  "arn:aws:quicksight:us-east-1:566574573255:user/default/admin/rrmarq-Isengard"
+          Actions:
+            - quicksight:UpdateDataSourcePermissions
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+
+  QuickSightAnalysis:
+    Type: AWS::QuickSight::Analysis
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AnalysisId: 1994d673-2102-4f6c-99a8-0172dbe78690
+      Name: !Sub ${ProjectName}-Analysis
+      AwsAccountId: !Ref AWS::AccountId
+      SourceEntity:
+        SourceTemplate:
+          Arn: !GetAtt QuickSightTemplate.Arn
+          DataSetReferences:
+            - DataSetPlaceholder: 'Requests'
+              DataSetArn: !GetAtt QuickSightDataSet.Arn
+      Permissions:
+        - Principal:  "arn:aws:quicksight:us-east-1:566574573255:user/default/admin/rrmarq-Isengard"
+          Actions:
+            - quicksight:RestoreAnalysis
+            - quicksight:UpdateAnalysisPermissions
+            - quicksight:DeleteAnalysis
+            - quicksight:DescribeAnalysisPermissions
+            - quicksight:QueryAnalysis
+            - quicksight:DescribeAnalysis
+            - quicksight:UpdateAnalysis
+  
+  QuickSightTemplate:
+    Type: AWS::QuickSight::Template
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      TemplateId: fca37d68-5bb3-4015-bd3f-88ff15e12388
+      Name: !Sub ${ProjectName}-Template
+      AwsAccountId: !Ref AWS::AccountId
+      SourceEntity:
+        SourceAnalysis:
+          Arn: arn:aws:quicksight:us-east-1:566574573255:analysis/aa7e9572-3cf5-45fa-a07c-fd811a4b416e
+          DataSetReferences:
+            - DataSetArn: "arn:aws:quicksight:us-east-1:566574573255:dataset/82af7f18-0b28-4ad8-9054-84c8c64c27b7"
+              DataSetPlaceholder:  "Requests"
+      Permissions:
+        - Principal:  "arn:aws:quicksight:us-east-1:566574573255:user/default/admin/rrmarq-Isengard"
+          Actions:
+            - quicksight:DescribeTemplate
+      VersionDescription: Initial version - Copied over from AWS account.
+
+  QuickSightDashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      DashboardId: 6c691eb5-4f8a-45fa-b3dd-e3b07f92ed1d
+      Name: !Sub ${ProjectName}-Dashboard
+      AwsAccountId: !Ref AWS::AccountId
+      SourceEntity:
+        SourceTemplate:
+          Arn: !GetAtt  QuickSightTemplate.Arn
+          DataSetReferences:
+            - DataSetPlaceholder: 'Requests'
+              DataSetArn: !GetAtt QuickSightDataSet.Arn
+      Permissions:
+        - Principal:  "arn:aws:quicksight:us-east-1:566574573255:user/default/admin/rrmarq-Isengard"
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:ListDashboardVersions
+            - quicksight:UpdateDashboardPermissions
+            - quicksight:QueryDashboard
+            - quicksight:UpdateDashboard
+            - quicksight:DeleteDashboard
+            - quicksight:DescribeDashboardPermissions
+            - quicksight:UpdateDashboardPublishedVersion
+      DashboardPublishOptions:
+        AdHocFilteringOption:
+          AvailabilityStatus: ENABLED
+    
+  EBScheduler:
+    DependsOn: EBSchedulerRole
+    Type: AWS::Scheduler::Schedule
+    Properties: 
+      Description: Scheduler for logs SFN
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Name: !Sub ${ProjectName}-Scheduler
+      ScheduleExpression: rate(1 days)
+      ScheduleExpressionTimezone: "America/Sao_Paulo"
+      StartDate: "2023-03-24T22:28:00.000Z"
+      State: ENABLED
+      Target: 
+        Arn: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-centralizer-logs
+        Input:
+          Fn::Sub:
+          |
+              {
+                "data_exec": "<aws.scheduler.scheduled-time>",
+                "central_account": "${AWS::AccountId}" 
+              }
+        RoleArn: !GetAtt [EBSchedulerRole, Arn]
+
+  EBSchedulerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      RoleName: !Sub ${ProjectName}-Scheduler
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service: 
+            - "scheduler.amazonaws.com"
+          Action: "sts:AssumeRole"
+          Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${ProjectName}-Scheduler"
+
+      Path: "/"
+      Policies:
+      - PolicyName: "SchedulerPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "states:StartExecution"
+            Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-centralizer-logs"
+
+
+  StackSetLocals:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      StackSetName: !Sub StackSet-${ProjectName}
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: false
+      Capabilities: 
+        - CAPABILITY_NAMED_IAM
+        - CAPABILITY_IAM
+      CallAs: SELF
+      ManagedExecution:
+        Active: true
+      PermissionModel: SERVICE_MANAGED
+      TemplateURL: !Sub https://${BucketArtifacts}.s3.amazonaws.com/iac/local-stack.yaml
+      Parameters:
+        - ParameterKey: ProjectName
+          ParameterValue: !Ref ProjectName
+        - ParameterKey: CentralAccount
+          ParameterValue: !Ref AWS::AccountId
+      StackInstancesGroup:
+        - Regions: !Ref Regions
+          DeploymentTargets:
+            OrganizationalUnitIds: !Ref OUs
+      OperationPreferences:
+        RegionConcurrencyType: PARALLEL
+        FailureToleranceCount: 1
+        MaxConcurrentCount: 2
+
+  CrossAccountSendSignalsRole:
+    Type: "AWS::IAM::Role"
+    DependsOn: StackSetLocals
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      RoleName: Centralizer-send-signal-state
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            AWS:
+              - "*"
+          Action: "sts:AssumeRole"
+          Condition:
+            StringEquals:
+              aws:PrincipalOrgID: !Ref Orgs
+      Path: "/"
+      Policies:
+      - PolicyName: "SendTaskSignals"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "states:SendTaskSuccess"
+              - "states:SendTaskFailure"
+            Resource: "*"
+
