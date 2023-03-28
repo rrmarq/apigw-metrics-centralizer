@@ -16,6 +16,9 @@ Parameters:
     Type: String
 
 Resources:
+########################################################################################################################
+###                                   API Gateway                                                                   ####
+########################################################################################################################
   RestApi:
     Type: 'AWS::ApiGateway::RestApi'
     Properties:
@@ -24,6 +27,9 @@ Resources:
       - Key: Project
         Value: !Sub ${ProjectName}-Project
 
+########################################################################################################################
+###                                   API Usage Plans and API Keys                                                  ####
+########################################################################################################################
   ApiUsagePlan:
     Type: 'AWS::ApiGateway::UsagePlan'
     DependsOn: APIGWStage
@@ -150,129 +156,6 @@ Resources:
             ResponseTemplates:
               application/json: "{\"message\": \"Houston, we have a problem!\"}"
 
-  KinesisFirehoseDeliveryStream:
-    Type: 'AWS::KinesisFirehose::DeliveryStream'
-    Properties:
-      DeliveryStreamType: DirectPut
-      DeliveryStreamName: 'amazon-apigateway-access-logs'
-      Tags:
-      - Key: Project
-        Value: !Sub ${ProjectName}-Project
-      ExtendedS3DestinationConfiguration:
-        BucketArn: !GetAtt [BucketLogs, Arn]
-        RoleArn: !GetAtt [DeliveryStreamRole, Arn]
-        CompressionFormat: 'UNCOMPRESSED'
-        BufferingHints:
-          IntervalInSeconds: 300
-          SizeInMBs: 128
-        CloudWatchLoggingOptions:
-          Enabled: true
-          LogGroupName: !Sub 'Destination-${ProjectName}'
-          LogStreamName: !Sub '${ProjectName}/stream'
-        Prefix: '!{timestamp:yyyy-MM-dd}/!{partitionKeyFromQuery:requestId}'
-        ErrorOutputPrefix: 'errors'
-        DynamicPartitioningConfiguration:
-          Enabled: true
-          RetryOptions:
-            DurationInSeconds: 300
-        ProcessingConfiguration:
-          Enabled: true
-          Processors:
-          - Type: MetadataExtraction
-            Parameters:
-            - ParameterName: MetadataExtractionQuery
-              ParameterValue: '{requestId : .requestId}'
-            - ParameterName: JsonParsingEngine
-              ParameterValue: JQ-1.6
-          - Type: RecordDeAggregation
-            Parameters:
-            - ParameterName: SubRecordType
-              ParameterValue: JSON
-
-
-
-
-  DeliveryStreamRole:
-    Type: 'AWS::IAM::Role'
-    Properties:
-      Tags:
-      - Key: Project
-        Value: !Sub ${ProjectName}-Project
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - firehose.amazonaws.com
-            Action:
-              - 'sts:AssumeRole'
-      Policies:
-        - PolicyName: 'DeliveryStreamPolicy'
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 's3:AbortMultipartUpload'
-                  - 's3:GetBucketLocation'
-                  - 's3:GetObject'
-                  - 's3:ListBucket'
-                  - 's3:ListBucketMultipartUploads'
-                  - 's3:PutObject'
-                Resource:
-                  - !GetAtt [BucketLogs, Arn]
-                  - !Sub
-                    - ${bucket}/*
-                    - { bucket: !GetAtt [BucketLogs, Arn]}
-
-  LambdaFunction:
-    Type: 'AWS::Lambda::Function'
-    Properties:
-      FunctionName: !Ref ProjectName
-      Handler: 'index.handler'
-      Role: !GetAtt [LambdaExecutionRole, Arn]
-      Runtime: 'nodejs12.x'
-      Code:
-        S3Bucket: !Sub capstone-artifacts-${CentralAccount}
-        S3Key: 'lambda-HW/index.zip'
-      Tags:
-      - Key: Project
-        Value: !Sub ${ProjectName}-Project
-
-  LambdaPermission:
-    Type: 'AWS::Lambda::Permission'
-    Properties:
-      Action: 'lambda:InvokeFunction'
-      FunctionName: !Ref LambdaFunction
-      Principal: 'apigateway.amazonaws.com'
-
-  LambdaExecutionRole:
-    Type: "AWS::IAM::Role"
-    Properties:
-      Tags:
-      - Key: Project
-        Value: !Sub ${ProjectName}-Project
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-        - Effect: "Allow"
-          Principal:
-            Service: "lambda.amazonaws.com"
-          Action: "sts:AssumeRole"
-      Path: "/"
-      Policies:
-      - PolicyName: "MyLambdaPolicy"
-        PolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-          - Effect: "Allow"
-            Action:
-            - "logs:CreateLogGroup"
-            - "logs:CreateLogStream"
-            - "logs:PutLogEvents"
-            Resource: "arn:aws:logs:*:*:*"
-
   DeploymentV2:
     Type: 'AWS::ApiGateway::Deployment'
     DependsOn: HWMethod
@@ -319,6 +202,86 @@ Resources:
                                       }
                   }"
 
+
+########################################################################################################################
+###                                   Kineis DataFirehouse                                                          ####
+########################################################################################################################
+  KinesisFirehoseDeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamType: DirectPut
+      DeliveryStreamName: 'amazon-apigateway-access-logs'
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      ExtendedS3DestinationConfiguration:
+        BucketArn: !GetAtt [BucketLogs, Arn]
+        RoleArn: !GetAtt [DeliveryStreamRole, Arn]
+        CompressionFormat: 'UNCOMPRESSED'
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 128
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub 'Destination-${ProjectName}'
+          LogStreamName: !Sub '${ProjectName}/stream'
+        Prefix: '!{timestamp:yyyy-MM-dd}/!{partitionKeyFromQuery:requestId}'
+        ErrorOutputPrefix: 'errors'
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+          - Type: MetadataExtraction
+            Parameters:
+            - ParameterName: MetadataExtractionQuery
+              ParameterValue: '{requestId : .requestId}'
+            - ParameterName: JsonParsingEngine
+              ParameterValue: JQ-1.6
+          - Type: RecordDeAggregation
+            Parameters:
+            - ParameterName: SubRecordType
+              ParameterValue: JSON
+
+  DeliveryStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'DeliveryStreamPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !GetAtt [BucketLogs, Arn]
+                  - !Sub
+                    - ${bucket}/*
+                    - { bucket: !GetAtt [BucketLogs, Arn]}
+
+########################################################################################################################
+###                                   Distributed Step Functions                                                    ####
+########################################################################################################################
   StateMachine:
     Type: AWS::StepFunctions::StateMachine
     DependsOn: StateMachineRole
@@ -429,7 +392,22 @@ Resources:
       RoleArn: !GetAtt StateMachineRole.Arn
       StateMachineType: STANDARD
       StateMachineName: !Sub "${ProjectName}-local-logs"
+      LoggingConfiguration:
+        Destinations: 
+          - CloudWatchLogsLogGroup: 
+              LogGroupArn: !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/step-functions/${ProjectName}-local-logs:*"
+        IncludeExecutionData: true
+        Level: ALL
+      TracingConfiguration: true
 
+  SFNLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub "/step-functions/${ProjectName}-local-logs"
+      RetentionInDays: 30
+      Tags: 
+        - Key: Project
+          Value: !Sub ${ProjectName}-Project
 
   StateMachineRole:
     Type: "AWS::IAM::Role"
@@ -493,7 +471,21 @@ Resources:
                   - "xray:GetSamplingRules"
                   - "xray:GetSamplingTargets"
                 Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogDelivery"
+                  - "logs:GetLogDelivery"
+                  - "logs:UpdateLogDelivery"
+                  - "logs:DeleteLogDelivery"
+                  - "logs:ListLogDeliveries"
+                  - "logs:PutResourcePolicy"
+                  - "logs:DescribeResourcePolicies"
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
 
+########################################################################################################################
+###                                   Lambda Clieaning                                                              ####
+########################################################################################################################
   LambdaFunctionCleaning:
     Type: 'AWS::Lambda::Function'
     DependsOn: LambdaCleaningExecutionRole
@@ -558,7 +550,59 @@ Resources:
               - !GetAtt [BucketLogs, Arn]
               - !Join ["", [!GetAtt [BucketLogs, Arn], "/*"]]
 
+########################################################################################################################
+###                                   Lambda Error Path - Just for Demo                                             ####
+########################################################################################################################
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref ProjectName
+      Handler: 'index.handler'
+      Role: !GetAtt [LambdaExecutionRole, Arn]
+      Runtime: 'nodejs12.x'
+      Code:
+        S3Bucket: !Sub capstone-artifacts-${CentralAccount}
+        S3Key: 'lambda-HW/index.zip'
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
 
+  LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref LambdaFunction
+      Principal: 'apigateway.amazonaws.com'
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service: "lambda.amazonaws.com"
+          Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: "MyLambdaPolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+
+########################################################################################################################
+###                                   Distributed Bucket                                                            ####
+########################################################################################################################
   BucketLogs:
     Type: 'AWS::S3::Bucket'
     Properties:

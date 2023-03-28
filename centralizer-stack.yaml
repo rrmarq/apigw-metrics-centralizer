@@ -28,6 +28,9 @@ Parameters:
     Type: String
 
 Resources:
+########################################################################################################################
+###                                   Main Step Functions                                                           ####
+########################################################################################################################
   StateMachine:
     DependsOn: AthenaNamedQuery
     Type: AWS::StepFunctions::StateMachine
@@ -318,7 +321,23 @@ Resources:
         - QueryId: !GetAtt AthenaNamedQuery.NamedQueryId
       RoleArn: !GetAtt StateMachineRole.Arn
       StateMachineType: STANDARD
+      LoggingConfiguration:
+        Destinations: 
+          - CloudWatchLogsLogGroup: 
+              LogGroupArn: !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/step-functions/logs-centralizer-logs:*"
+        IncludeExecutionData: true
+        Level: ALL
       StateMachineName: !Sub "${ProjectName}-centralizer-logs"
+      TracingConfiguration: true
+
+  SFNLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub "/step-functions/${ProjectName}-centralizer-logs"
+      RetentionInDays: 30
+      Tags: 
+        - Key: Project
+          Value: !Sub ${ProjectName}-Project
 
 
   StateMachineRole:
@@ -414,6 +433,9 @@ Resources:
                   - "quicksight:CreateIngestion"
                 Resource: !Sub "arn:aws:quicksight:*:${AWS::AccountId}:dataset/*/ingestion/*"
 
+########################################################################################################################
+###                                   Message Format Lambda                                                         ####
+########################################################################################################################
   LambdaFunctionMessage:
     Type: 'AWS::Lambda::Function'
     DependsOn: LambdaFunctionMessageExecutionRole
@@ -468,6 +490,9 @@ Resources:
               - "logs:PutLogEvents"
             Resource: "arn:aws:logs:*:*:*"
 
+########################################################################################################################
+###                                   Get Org Accounts Lambda                                                       ####
+########################################################################################################################
   LambdaFunctionAccounts:
     Type: 'AWS::Lambda::Function'
     DependsOn: LambdaFunctionAccountsExecutionRole
@@ -526,6 +551,9 @@ Resources:
               - "organizations:ListAccounts"
             Resource: "*"
 
+########################################################################################################################
+###                                   Central Bucket                                                                ####
+########################################################################################################################
   BucketLogsCentralizer:
     Type: 'AWS::S3::Bucket'
     Properties:
@@ -534,6 +562,9 @@ Resources:
       - Key: Project
         Value: !Sub ${ProjectName}-Project
 
+########################################################################################################################
+###                                   Central Logs Table                                                            ####
+########################################################################################################################
   LogsTable:
     Type: AWS::Glue::Table
     DependsOn: BucketLogsCentralizer
@@ -580,6 +611,9 @@ Resources:
             - Name: reqid
               Type: string
 
+########################################################################################################################
+###                                   Athena Workgroup                                                              ####
+########################################################################################################################
   AthenaWorkgroup:
     Type: AWS::Athena::WorkGroup
     Properties:
@@ -595,6 +629,9 @@ Resources:
           EncryptionConfiguration: 
             EncryptionOption: SSE_S3
 
+########################################################################################################################
+###                                   Athena Query                                                                  ####
+########################################################################################################################
   AthenaNamedQuery:
     DependsOn: AthenaWorkgroup
     Type: AWS::Athena::NamedQuery
@@ -626,6 +663,9 @@ Resources:
 
         group by a.apiKey, a.account
 
+########################################################################################################################
+###                                   SNS Message Topic                                                             ####
+########################################################################################################################
   NotificationTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -638,6 +678,9 @@ Resources:
       TopicName: !Sub ${ProjectName}-Topic-Messages
       TracingConfig: Active
 
+########################################################################################################################
+###                                   QuickSight Dataset                                                            ####
+########################################################################################################################
   QuickSightDataSet:
     DependsOn: QuickSightDataSource
     Type: AWS::QuickSight::DataSet
@@ -696,6 +739,9 @@ Resources:
             - quicksight:CreateIngestion
             - quicksight:CancelIngestion
 
+########################################################################################################################
+###                                   QuickSight Datasource                                                         ####
+########################################################################################################################
   QuickSightDataSource:
     Type: AWS::QuickSight::DataSource
     Properties:
@@ -721,6 +767,9 @@ Resources:
             - quicksight:UpdateDataSource
             - quicksight:DeleteDataSource
 
+########################################################################################################################
+###                                   QuickSight Analysis                                                           ####
+########################################################################################################################
   QuickSightAnalysis:
     Type: AWS::QuickSight::Analysis
     Properties:
@@ -746,7 +795,10 @@ Resources:
             - quicksight:QueryAnalysis
             - quicksight:DescribeAnalysis
             - quicksight:UpdateAnalysis
-  
+
+########################################################################################################################
+###                                   QuickSight Template                                                           ####
+########################################################################################################################
   QuickSightTemplate:
     Type: AWS::QuickSight::Template
     Properties:
@@ -768,6 +820,9 @@ Resources:
             - quicksight:DescribeTemplate
       VersionDescription: Initial version - Copied over from AWS account.
 
+########################################################################################################################
+###                                   QuickSight Dashboard                                                          ####
+########################################################################################################################
   QuickSightDashboard:
     Type: AWS::QuickSight::Dashboard
     Properties:
@@ -797,7 +852,10 @@ Resources:
       DashboardPublishOptions:
         AdHocFilteringOption:
           AvailabilityStatus: ENABLED
-    
+
+########################################################################################################################
+###                                   EventBridge Scheduler                                                         ####
+########################################################################################################################
   EBScheduler:
     DependsOn: EBSchedulerRole
     Type: AWS::Scheduler::Schedule
@@ -852,7 +910,43 @@ Resources:
               - "states:StartExecution"
             Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-centralizer-logs"
 
+########################################################################################################################
+###                                   Send SFN Signals Role                                                         ####
+########################################################################################################################
+  CrossAccountSendSignalsRole:
+    Type: "AWS::IAM::Role"
+    DependsOn: StackSetLocals
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      RoleName: Centralizer-send-signal-state
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            AWS:
+              - "*"
+          Action: "sts:AssumeRole"
+          Condition:
+            StringEquals:
+              aws:PrincipalOrgID: !Ref Orgs
+      Path: "/"
+      Policies:
+      - PolicyName: "SendTaskSignals"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "states:SendTaskSuccess"
+              - "states:SendTaskFailure"
+            Resource: "*"
 
+########################################################################################################################
+###                                   CloudFormation StackSet                                                       ####
+########################################################################################################################
   StackSetLocals:
     Type: AWS::CloudFormation::StackSet
     Properties:
@@ -885,34 +979,5 @@ Resources:
         FailureToleranceCount: 1
         MaxConcurrentCount: 2
 
-  CrossAccountSendSignalsRole:
-    Type: "AWS::IAM::Role"
-    DependsOn: StackSetLocals
-    Properties:
-      Tags:
-      - Key: Project
-        Value: !Sub ${ProjectName}-Project
-      RoleName: Centralizer-send-signal-state
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-        - Effect: "Allow"
-          Principal:
-            AWS:
-              - "*"
-          Action: "sts:AssumeRole"
-          Condition:
-            StringEquals:
-              aws:PrincipalOrgID: !Ref Orgs
-      Path: "/"
-      Policies:
-      - PolicyName: "SendTaskSignals"
-        PolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-          - Effect: "Allow"
-            Action:
-              - "states:SendTaskSuccess"
-              - "states:SendTaskFailure"
-            Resource: "*"
+
 
