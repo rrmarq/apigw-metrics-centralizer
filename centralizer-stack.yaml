@@ -66,8 +66,25 @@ Resources:
                     "BackoffRate": 2
                   }
                 ],
-                "Next": "Map"
+                "Next": "Map",
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ]
               },
+              "DLQ": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sqs:sendMessage",
+                "Parameters": {
+                  "MessageBody.$": "$",
+                  "QueueUrl": "https://sqs.us-east-1.amazonaws.com/${AWS::AccountId}/${ProjectName}-DLQ"
+              },
+              "End": true
+            },
               "Map": {
                 "Type": "Map",
                 "ItemProcessor": {
@@ -230,6 +247,14 @@ Resources:
                     "MaxAttempts": 1
                   }
                 ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ],
                 "ToleratedFailurePercentage": 5,
                 "ItemSelector": {
                   "account.$": "$$.Map.Item.Value.account",
@@ -244,6 +269,24 @@ Resources:
                 "Parameters": {
                   "NamedQueryId": "${QueryId}"
                 },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "BackoffRate": 1,
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 1
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ],
                 "Resource": "arn:aws:states:::aws-sdk:athena:getNamedQuery"
               },
               "Athena StartQueryExecution": {
@@ -256,6 +299,24 @@ Resources:
                     "OutputLocation": "s3://${ProjectName}-centralizer-${AWS::AccountId}/athena-result/"
                   }
                 },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "BackoffRate": 1,
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 1
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ],
                 "Next": "Athena GetQueryResults",
                 "ResultSelector": {
                   "QueryExecutionId.$": "$.QueryExecution.QueryExecutionId"
@@ -268,6 +329,24 @@ Resources:
                 "Parameters": {
                   "QueryExecutionId.$": "$.QueryExecutionId"
                 },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "BackoffRate": 1,
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 1
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ],
                 "Next": "Lambda Invoke"
               },
               "Lambda Invoke": {
@@ -294,6 +373,14 @@ Resources:
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ],
                 "Next": "SNS Publish"
               },
               "SNS Publish": {
@@ -304,6 +391,24 @@ Resources:
                   "Message.$": "States.StringToJson($.body)",
                   "TopicArn": "arn:aws:sns:us-east-1:${AWS::AccountId}:${ProjectName}-Topic-Messages"
                 },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "BackoffRate": 1,
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 1
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ],
                 "Next": "CreateIngestion"
               },
               "CreateIngestion": {
@@ -313,6 +418,24 @@ Resources:
                   "DataSetId": "3c1ba7e0-6fc4-4af2-94f6-490fecb65594",
                   "IngestionId.$": "States.UUID()"
                 },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "BackoffRate": 1,
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 1
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "DLQ"
+                  }
+                ],
                 "Resource": "arn:aws:states:::aws-sdk:quicksight:createIngestion",
                 "End": true
               }
@@ -405,6 +528,10 @@ Resources:
                 Action:
                   - "sns:Publish"
                 Resource: !Sub "arn:aws:sns:*:${AWS::AccountId}:*"
+              - Effect: "Allow"
+                Action:
+                  - "sqs:SendMessage"
+                Resource: !Sub "arn:aws:sqs:*:${AWS::AccountId}:*"
               - Effect: "Allow"
                 Action:
                   - "logs:CreateLogDelivery"
@@ -677,6 +804,35 @@ Resources:
         Value: !Sub ${ProjectName}-Project
       TopicName: !Sub ${ProjectName}-Topic-Messages
       TracingConfig: Active
+
+########################################################################################################################
+###                                   SQS DLQ                                                                       ####
+########################################################################################################################
+  SQSDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      Tags:
+      - Key: Project
+        Value: !Sub ${ProjectName}-Project
+      QueueName: !Sub ${ProjectName}-DLQ
+
+  SQSDLQPolicy: 
+    Type: AWS::SQS::QueuePolicy
+    DependsOn: SQSDLQ
+    Properties: 
+      Queues: 
+        - !Sub "https://sqs:us-east-2.amazonaws.com/${AWS::AccountId}/${ProjectName}-DLQ"
+      PolicyDocument: 
+        Statement: 
+          - 
+            Action: 
+              - "SQS:SendMessage" 
+              - "SQS:ReceiveMessage"
+            Effect: "Allow"
+            Resource: !Sub "arn:aws:sqs:us-east-2:${AWS::AccountId}:${ProjectName}-DLQ"
+            Principal:  
+              AWS: 
+                - !Ref AWS::AccountId     
 
 ########################################################################################################################
 ###                                   QuickSight Dataset                                                            ####
